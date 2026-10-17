@@ -1,0 +1,91 @@
+name: CortexDB round2 fork validation
+
+on:
+  push:
+    branches: [audit/cortexdb-round2-validation-20261017]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cortexdb-round2-fork-validation
+  cancel-in-progress: false
+
+jobs:
+  go-validation:
+    if: github.repository == 'rudycelekli/cortexdb'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GOENV: 'off'
+      GOTOOLCHAIN: local
+      GOMAXPROCS: '2'
+    steps:
+      - name: Check out validation helper commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, verified 2026-10-17
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+
+      - name: Select and verify exact code parent
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp .github/scripts/cortexdb-round2-validation.sh "$RUNNER_TEMP/cortexdb-round2-validation.sh"
+          cortex_code_commit="$(git rev-parse HEAD^)"
+          git checkout --detach "$cortex_code_commit"
+          test "$(git rev-parse HEAD^{tree})" = cf73b76814f16351823906c97e25d8d0e7a8aef6
+          test "$(git rev-parse HEAD^)" = e8274fdb8bd591503a356a37ca7533c6e44c5908
+          git diff --exit-code
+          printf 'Validated code commit: `%s`\n\nExpected tree: `cf73b76814f16351823906c97e25d8d0e7a8aef6`\n' "$cortex_code_commit" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up module-declared Go toolchain
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5, verified 2026-10-17
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Download and verify locked Go modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GOPATH="$RUNNER_TEMP/cortexdb-gopath"
+          export GOMODCACHE="$RUNNER_TEMP/cortexdb-gomodcache"
+          export GOCACHE="$RUNNER_TEMP/cortexdb-gocache"
+          export GOTMPDIR="$RUNNER_TEMP/cortexdb-compiletmp"
+          export TMPDIR="$RUNNER_TEMP/cortexdb-fixtures"
+          mkdir -p "$GOPATH" "$GOMODCACHE" "$GOCACHE" "$GOTMPDIR" "$TMPDIR"
+          go version
+          go mod download
+          go mod verify
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Run required Go gates with loopback-only networking
+        shell: bash
+        run: |
+          set -euo pipefail
+          cortex_uid="$(id -u)"
+          cortex_gid="$(id -g)"
+          cortex_ip="$(command -v ip)"
+          cortex_unshare="$(command -v unshare)"
+          cortex_setpriv="$(command -v setpriv)"
+          sudo -n true
+          # Preserve the existing ephemeral runner HOME; do not repurpose it.
+          # env -i excludes Actions/provider credentials. Only this child network
+          # namespace is changed; the Actions runner agent keeps its own network.
+          sudo -n /usr/bin/env -i \
+            PATH="$PATH" HOME="$HOME" LANG=C.UTF-8 \
+            RUNNER_TEMP="$RUNNER_TEMP" \
+            GOPATH="$RUNNER_TEMP/cortexdb-gopath" \
+            GOMODCACHE="$RUNNER_TEMP/cortexdb-gomodcache" \
+            GOCACHE="$RUNNER_TEMP/cortexdb-gocache" \
+            GOTMPDIR="$RUNNER_TEMP/cortexdb-compiletmp" \
+            TMPDIR="$RUNNER_TEMP/cortexdb-fixtures" \
+            GOENV=off GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off GOMAXPROCS=2 \
+            CORTEX_CI_UID="$cortex_uid" CORTEX_CI_GID="$cortex_gid" \
+            CORTEX_CI_IP="$cortex_ip" CORTEX_CI_SETPRIV="$cortex_setpriv" \
+            "$cortex_unshare" --net /bin/bash -ceu '
+              "$CORTEX_CI_IP" link set lo up
+              exec "$CORTEX_CI_SETPRIV" --reuid="$CORTEX_CI_UID" --regid="$CORTEX_CI_GID" --init-groups \
+                /bin/bash "$RUNNER_TEMP/cortexdb-round2-validation.sh"
+            '
